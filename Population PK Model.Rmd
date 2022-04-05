@@ -1,0 +1,483 @@
+---
+title: "Population Pharmacokinetic Modeling (PopPK) using R"
+output: html_notebook
+---
+
+# INTRODUCTION 
+110 patients received a 100 mg oral dose of Drug X. Plasma concentrations were sampled from 1 to 10 hours for each patient. Sex and age along with concentration data are provided (0 = female, 1 = male). 
+
+## Objective
+Construct a population PK model with covariates. 
+
+## Setup
+```{r warning=F, message=F}
+#install.packages("saemix")
+
+library(tidyverse)
+library(saemix)
+library(PKNCA)
+library(trelliscopejs)
+library(ggsignif)
+
+```
+
+
+
+# EXPLORATORY ANALYSIS 
+
+
+## Data Import 
+```{r}
+all.data <- read.csv("Data files/PopPK Data.csv") %>% rename("Dose" = "Aa")
+all.data$id <- as.factor(all.data$id)
+head(all.data)
+```
+
+
+## Concentration vs Time Plot 
+```{r}
+CT1.plot <- ggplot(data = all.data, aes(x = Time, y = CObs))+ 
+  geom_line(aes(group = id, color = id))+ 
+  geom_point(aes(color = id))+
+  lims(x = c(0,10))+
+  theme(legend.position = "none")
+  
+CT1.plot
+CT1.plot + scale_y_log10(limits = c(0.001,10))
+
+```
+
+
+## Concentration vs Time by Covariates 
+```{r}
+CT1.plot + scale_y_log10(limits = c(0.001,10)) + facet_grid(.~Gender)
+```
+
+
+# INITIAL ESTIMATES
+
+## Non-Compartmental Analysis (NCA)
+```{r message=F}
+naive.conc <- all.data %>% 
+  group_by(Time) %>% 
+  summarize(Conc = mean(CObs), id = "All Subjects") %>% 
+  ungroup()
+
+naive.conc$Conc[naive.conc$Time == 0] <- 0
+
+naive.dose <- tibble(Dose = 100, Time = 0, id = "All Subjects")
+
+interval.data <- tibble(start = 0, 
+                        end = 10,
+                        aucall = T,
+                        auclast = T, 
+                        aucinf.obs = T,
+                        aucinf.pred = T,
+                        cmax = T, 
+                        vz.obs = T,
+                        cl.obs = T)
+
+
+dose.data <- PKNCAdose(naive.dose, Dose~Time|id)
+conc.data <- PKNCAconc(naive.conc, Conc~Time|id)
+
+NCA.data <- PKNCAdata(conc.data, intervals = interval.data)
+NCA.result <- pk.nca(NCA.data)
+NCA.summary <- NCA.result$result %>%
+  spread(key = PPTESTCD, value = PPORRES) %>% 
+  mutate(CL = naive.dose$Dose[1]/aucinf.obs,
+         V = CL/lambda.z) %>%
+  select(aucinf.obs, half.life, cmax, CL, V, lambda.z) %>% 
+  gather(1:6, key = "Parameter", value = "Value")
+
+ggplot(naive.conc, aes(x = Time, y = Conc))+
+  geom_line()+
+  geom_point()+
+  scale_y_log10()
+
+```
+
+
+### PK Parameter Summary 
+```{r}
+NCA.summary
+```
+
+
+
+# BASE MODEL 
+
+## Model Structure
+```{r}
+pk.model1 <- function(psi, t){
+  D  <- 100
+  ka <- psi[1]
+  V  <- psi[2]
+  ke <- psi[3]
+  f  <- D*ka/V/(ka-ke)*(exp(-ke*t)-exp(-ka*t)) 
+  return(f)}
+
+```
+
+
+## Parameter Optimization
+
+### Naive Data Estimate using NLS
+```{r}
+pkm1 <- nls(CObs ~ pk.model1(psi = psi, t = Time), 
+            start=list(psi=c(ka=1, V=66.69, ke=0.126)), 
+            data=all.data)
+coef(pkm1)
+
+grid <- tibble(Time = seq(0,11,0.1))
+grid$pred <- predict(pkm1, grid)
+
+ggplot(all.data, aes(x = Time, y = CObs))+
+  geom_point()+
+  geom_point(color = "red", size = 4, data = naive.conc, aes(x = Time, y = Conc))+
+  geom_line(data = grid, aes(x = Time, y = pred), size = 1, color = "red")+ lims(x = c(0,12))
+
+```
+
+### SAEM Optimization
+```{r}
+model1cpt <- function(psi,id,x) { 
+  D   <- 100
+  t   <-x[,1] 
+  ka  <-psi[id,1]
+  V   <-psi[id,2]
+  ke  <-psi[id,3]
+  fpred <-D*ka/(V*(ka-ke))*(exp(-ke*t)-exp(-ka*t))
+  return(fpred)
+  } 
+```
+
+```{r echo=F}
+
+saemix.data <- saemixData(name.data = all.data %>%
+                            filter(Time !=0),
+                          name.group      = "id",
+                          name.predictors = "Time",
+                          name.response   = "CObs")
+
+saemix.model <- saemixModel(model = model1cpt, 
+                            psi0  = c(ka=4.2,V=78.89,ke = 0.0834))
+
+saemix.options <- list(map=TRUE, fim=TRUE, ll.is=FALSE, 
+                       seed=23456, print = F, save = F, save.graphs = F)
+saemix.fit1    <- saemix(saemix.model, saemix.data, saemix.options)
+
+```
+
+
+```{r}
+saemix.fit1@results
+
+psi <- psi(saemix.fit1) %>% mutate(id = seq(1,110,1))
+psi$Gender <- all.data$Gender[all.data$Time == 0]
+psi$Age <- all.data$Age[all.data$Time == 0]
+psi <- psi %>% select(id,ka,V,ke,Gender,Age)
+
+
+
+```
+
+```{r message = F}
+
+grid1 <- grid %>% mutate(SAEM_pred = 100*1.238/(101.36*(1.238-0.5))*
+                  (exp(-0.5*Time)-exp(-1.238*Time))) %>% 
+  gather(2:3, key = "Method", value = "Pred") %>% 
+  mutate(Method = if_else(Method == "pred","NLS","SAEM"))
+
+ggplot(data = grid1 %>% filter(Method == "SAEM"), aes(x = Time, y = Pred))+
+  geom_line(aes(color = Method), size = 1)+
+  geom_point(data = all.data, aes(x = Time, y = CObs), 
+             size = 3, shape = 21, color = "blue")
+```
+
+
+## Additive Error Model Evaluation
+#### DV vs IPRED
+```{r}
+saemix.plot.obsvspred(saemix.fit1, level = 1)
+```
+
+
+#### DV.IPRED vs IVAR
+```{r message=F}
+pred_1cmt <- function(ka, V, ke, Time){
+     C <- 100*ka/(V*(ka-ke))*(exp(-ke*Time)-exp(-ka*Time))
+  return(C)
+}
+
+grid2 <- psi %>% 
+  expand_grid(Time = seq(0,11, 0.1)) %>% 
+  mutate(SAEM_pred = pred_1cmt(ka, V, ke, Time)) %>% 
+  mutate(id = as_factor(id)) %>% left_join(all.data)
+
+
+
+PopPK.plot1 <- ggplot(data = grid2, aes(x = Time, y = CObs, group = id))+
+  geom_line(size = 1, aes(x = Time, y = SAEM_pred, color = id))+
+  geom_point(shape = 21, size = 3, aes(fill = id), alpha = 0.5)+
+  theme(legend.position = "none")
+
+PopPK.plot1
+```
+
+#### CWRES vs IVAR & IPRED
+```{r fig.asp=1}
+saemix.plot.scatterresiduals(saemix.fit1, level = 1)
+saemix.plot.distribresiduals(saemix.fit1, level = 1)
+```
+
+#### Final Parameters vs Initial Estimates
+
+## Proportional Error Model Evaluation ----
+
+```{r}
+saemix.model.prop <- saemixModel(model = model1cpt, 
+                            psi0  = c(ka=1.238,V=101.361,ke=0.498), 
+                            error.model = "proportional")
+
+saemix.fit2    <- saemix(saemix.model.prop, saemix.data, saemix.options)
+
+```
+
+
+```{r}
+saemix.fit2@results
+
+psi.prop <- psi(saemix.fit2) %>% mutate(id = seq(1,110,1))
+psi.prop$Gender <- all.data$Gender[all.data$Time == 0]
+psi.prop$Age <- all.data$Age[all.data$Time == 0]
+psi.prop <- psi.prop %>% select(id,ka,V,ke,Gender,Age)
+
+psi.prop
+
+eta.prop0 <- matrix(eta(saemix.fit2, type = "mean"), 
+                    ncol = 3, nrow = 110, 
+                    dimnames = list(seq(1,110,1), c("ka","V","ke")))
+
+eta.prop <- as_tibble(eta.prop0) %>% mutate(id = seq(1,110,1))
+eta.prop$Gender <- all.data$Gender[all.data$Time == 0]
+eta.prop$Age <- all.data$Age[all.data$Time == 0]
+eta.prop <- eta.prop %>% select(id,ka,V,ke,Gender,Age)
+
+eta.prop
+
+```
+
+#### DV vs IPRED
+#### DV.IPRED vs IVAR
+```{r}
+grid.prop <- psi.prop %>% 
+  expand_grid(Time = seq(0,11, 0.1)) %>% 
+  mutate(SAEM_pred = pred_1cmt(ka = ka, V = V, ke = ke, Time = Time)) %>% 
+  mutate(id = as_factor(id)) %>% left_join(all.data)
+
+
+
+PopPK.plot.prop <- ggplot(data = grid.prop, aes(x = Time, y = CObs, group = id))+
+  geom_line(size = 1, aes(x = Time, y = SAEM_pred, color = id))+
+  geom_point(shape = 21, size = 3, aes(fill = id), alpha = 0.5)+
+  theme(legend.position = "none")
+
+PopPK.plot.prop+ scale_y_log10()
+```
+
+#### CWRES vs IVAR
+```{r fig.asp=1}
+saemix.plot.scatterresiduals(saemix.fit2, level = 1)
+saemix.plot.distribresiduals(saemix.fit2, level = 1)
+```
+
+## Model Comparison 
+### AIC & BIC
+```{r}
+compare.saemix(saemix.fit1, saemix.fit2, method = "lin")
+
+```
+
+### Visual Predictive Checks
+
+
+#### Add + Prop Error Model
+```{r}
+fit2.coef <- coef.SaemixObject(saemix.fit2)$fixed
+
+saemix.model.comb <- saemixModel(model = model1cpt, 
+                            psi0  =fit2.coef, 
+                            error.model = "combined", verbose = F)
+
+saemix.fit3    <- saemix(saemix.model.comb, saemix.data, saemix.options)
+
+saemix.fit3@results
+
+```
+
+#### CWRES vs IVAR 
+
+# COVARIATE MODEL
+
+```{r fig.asp=0.9}
+
+psi.covar <- psi.prop %>% 
+  mutate(Gender = as_factor(if_else(Gender == 0, "Female", "Male"))) %>% 
+  gather(c(ka:ke), key = "Parameter", value = "Value")
+
+eta.covar <- eta.prop %>% 
+  mutate(Gender = as_factor(if_else(Gender == 0, "Female", "Male"))) %>% 
+  gather(c(ka:ke), key = "Parameter", value = "Value")
+
+ggplot(psi.covar, aes(x = Gender, y = Value))+
+  geom_boxplot()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  stat_summary(geom = "crossbar", aes(color = Gender), fun = mean)+
+  stat_summary(geom = "point", size = 3, shape = 21, 
+               aes(fill = Gender), fun = mean)+
+  geom_signif(comparisons = list(c("Male","Female")), 
+              test = "t.test", test.args = "two.sided", 
+              map_signif_level = c("***" = 0.001, "**"=0.01, "*"=0.05))
+
+
+ggplot(eta.covar, aes(x = Gender, y = Value))+
+  geom_boxplot()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  stat_summary(geom = "crossbar", aes(color = Gender), fun = mean)+
+  stat_summary(geom = "point", size = 3, shape = 21, 
+               aes(fill = Gender), fun = mean)+
+  geom_signif(comparisons = list(c("Male","Female")), 
+              test = "t.test", test.args = "two.sided", 
+              map_signif_level = c("***" = 0.001, "**"=0.01, "*"=0.05))
+
+# Age vs Parameters
+ggplot(psi.covar, aes(x = Age, y = Value))+
+  geom_point()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  geom_smooth(method = "glm")
+
+ggplot(eta.covar, aes(x = Age, y = Value))+
+  geom_point()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  geom_smooth(method = "glm")
+
+
+# Interaction between Gender and Age
+ggplot(psi.covar, aes(x = Age, y = Value))+
+  geom_point()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  geom_smooth(method = "glm", aes(color = Gender))
+
+ggplot(eta.covar, aes(x = Age, y = Value))+
+  geom_point()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  geom_smooth(method = "glm", aes(color = Gender))
+
+psi.corr <- psi.prop %>% select(-id, -Gender, -Age) %>% plot()
+eta.corr <- eta.prop %>% select(-id, -Gender, -Age) %>% plot()
+
+```
+
+
+```{r }
+
+saemix_covar.data <- saemixData(name.data = all.data %>%
+                            filter(Time !=0),
+                          name.group      = "id",
+                          name.predictors = "Time",
+                          name.response   = "CObs", 
+                          name.covariates = c("Gender","Age"))
+
+saemix_covar_model.prop <- saemixModel(model = model1cpt, 
+                            psi0  = fit2.coef, 
+                            error.model = "proportional",
+                            covariate.model = matrix(c(1,1,1,0,0,0), 
+                                                     nrow = 2, ncol = 3, 
+                                                     byrow = T))
+
+saemix.options <- list(map=TRUE, fim=TRUE, ll.is=FALSE, 
+                       seed=23456, print = F, save = F, save.graphs = F)
+saemix_covar.fit1    <- saemix(saemix_covar_model.prop, 
+                               saemix_covar.data, 
+                               saemix.options)
+```
+
+## Stepwise Covariate Search
+```{r}
+
+saemix_covar.fit1@results
+# res.stepwise <- step.saemix(saemix_covar.fit1, direction="both", 
+#                             covariate.init = matrix(c(1,0,1,0,1,1), 
+#                                                     nrow = 2, ncol = 3, 
+#                                                     byrow = T),
+#                             trace = T)
+
+res.stepwise
+```
+
+## Covariate Plots (w/best base model) 
+### ETA vs Covariate
+```{r}
+eta.covar0 <- matrix(eta(saemix_covar.fit1, type = "mean"), 
+                    ncol = 3, nrow = 110, 
+                    dimnames = list(seq(1,110,1), c("ka","V","ke")))
+
+eta.covar <- as_tibble(eta.covar0) %>% mutate(id = seq(1,110,1))
+eta.covar$Gender <- all.data$Gender[all.data$Time == 0]
+eta.covar$Age <- all.data$Age[all.data$Time == 0]
+eta.covar <- eta.covar %>% select(id,ka,V,ke,Gender,Age)
+
+eta.covar
+
+eta.covar <- eta.covar %>% 
+  mutate(Gender = as_factor(if_else(Gender == 0, "Female", "Male"))) %>% 
+  gather(c(ka:ke), key = "Parameter", value = "Value")
+
+ggplot(eta.covar, aes(x = Gender, y = Value))+
+  geom_boxplot()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")+
+  stat_summary(geom = "crossbar", aes(color = Gender), fun = mean)+
+  stat_summary(geom = "point", size = 3, shape = 21,
+               aes(fill = Gender), fun = mean)+
+  geom_signif(comparisons = list(c("Male","Female")),
+              test = "t.test", test.args = "two.sided",
+              map_signif_level = c("***" = 0.001, "**"=0.01, "*"=0.05))
+
+ggplot(eta.covar, aes(x = Age, y = Value))+
+  geom_point()+
+  geom_smooth()+
+  facet_wrap(.~Parameter, ncol = 2, scales = "free_y", strip.position = "top")
+
+```
+
+```{r}
+saemix.plot.scatterresiduals(saemix_covar.fit1, level = 1)
+saemix.plot.distribresiduals(saemix_covar.fit1, level = 1)
+```
+
+## Parameter Estimates of Covariate Model
+## Data Visualization of Covariate Model
+
+
+# COVARIANCE MODEL
+
+## Diagonal Model
+### ETA Scatter Plots (Theta Correlations)
+## Non-Diagonal Model (Based on Evidence)
+## Covariance Model Comparison
+
+
+# MODEL QUALIFICATION 
+
+## Boostrap - Quality of Theta Estimates
+## Bootstrap vs Final Model Estimates
+## Visual Predictive Check (Prediction Intervals)
+
+
+# MODELING AND SIMULATION 
+
+## Single Dose
+## Ascending Dose
+## Multiple Dosing Scenario
+## Multiple Ascending Dose
